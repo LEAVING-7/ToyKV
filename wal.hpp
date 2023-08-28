@@ -8,90 +8,97 @@
 #include <shared_mutex>
 #include <vector>
 
-constexpr std::size_t INIT_SEGMENT_FILE_ID = 1;
+constexpr std::size_t kInitSegmentFileID = 1;
 
 class WALReader;
 
-class WAL {
+class Wal {
 public:
-  WAL(Option const& option) { setup(option); }
-
-  auto setup(Option const& option) -> WALErrc
+  Wal(std::shared_ptr<Segment> activeSegment, std::map<SegmentID, std::shared_ptr<Segment>> olderSegments,
+      WalOption const& option, std::shared_ptr<Cache<std::uint64_t, Bytes>> blockCache,
+      std::uint32_t bytesWrite) noexcept
+      : mActiveSegment(std::move(activeSegment)), mOlderSegments(std::move(olderSegments)), mOption(option),
+        mBlockCache(std::move(blockCache)), mBytesWrite(bytesWrite)
   {
-    mOption = option;
-    mBytesWrite = 0;
+  }
+  ~Wal() { close(); }
+  static auto create(WalOption const& option) -> ext::expected<std::unique_ptr<Wal>, std::error_code>
+  {
     if (!option.segmentFileExt.starts_with(".")) {
-      throw std::runtime_error("segment file extension must start with '.'");
+      return ext::make_unexpected(WalErr::InvalidOption);
     }
     if (option.blockCache > option.segmentSize) {
-      throw std::runtime_error("block cache size must be less than segment size");
+      return ext::make_unexpected(WalErr::InvalidOption);
     }
     namespace fs = std::filesystem;
+    std::error_code ec;
+    
+    fs::create_directories(option.dirPath);
 
-    if (fs::create_directories(option.dirPath)) {
-      throw std::runtime_error("failed to create directory");
-    }
-
+    auto blockCache = std::shared_ptr<Cache<std::uint64_t, Bytes>>();
     if (option.blockCache > 0) {
-      auto lruSize = option.blockCache / BLOCK_SIZE;
-      if (option.blockCache % BLOCK_SIZE != 0) {
+      auto lruSize = option.blockCache / kBlockSize;
+      if (option.blockCache % kBlockSize != 0) {
         lruSize++;
       }
-      mBlockCache = std::make_unique<Cache<std::uint64_t, Bytes>>(lruSize);
+      blockCache = std::make_unique<Cache<std::uint64_t, Bytes>>(lruSize);
     }
-
     auto segmentIDs = std::vector<SegmentID>();
+
     auto entry_iter = fs::directory_iterator(option.dirPath);
     for (auto& entry : entry_iter) {
       if (entry.is_directory()) {
         continue;
       }
       auto id = SegmentID();
-      auto scanFormat = std::format("%u{}", option.segmentFileExt);
-      ::sscanf(entry.path().filename().c_str(), scanFormat.c_str(), &id);
+      if (entry.path().extension() != option.segmentFileExt) {
+        continue;
+      }
+      if (auto r = std::sscanf(entry.path().filename().c_str(), "%u", &id); r != 1) {
+        continue;
+      }
       segmentIDs.push_back(id);
     }
-
+    auto activeSegment = std::shared_ptr<Segment>();
+    auto olderSegments = std::map<SegmentID, std::shared_ptr<Segment>>();
     if (segmentIDs.empty()) {
-      auto segment =
-          std::make_shared<Segment>(option.dirPath.string(), option.segmentFileExt, INIT_SEGMENT_FILE_ID, mBlockCache);
-      mActiveSegment = segment;
+      activeSegment =
+          std::make_shared<Segment>(option.dirPath.string(), option.segmentFileExt, kInitSegmentFileID, blockCache);
     } else {
       std::sort(segmentIDs.begin(), segmentIDs.end());
-
       for (auto i = 0; i < segmentIDs.size(); i++) {
         auto segment =
-            std::make_shared<Segment>(option.dirPath.string(), option.segmentFileExt, segmentIDs[i], mBlockCache);
+            std::make_shared<Segment>(option.dirPath.string(), option.segmentFileExt, segmentIDs[i], blockCache);
         if (i == segmentIDs.size() - 1) {
-          mActiveSegment = segment;
+          activeSegment = segment;
         } else {
-          mOlderSegments[segmentIDs[i]] = segment;
+          olderSegments[segmentIDs[i]] = segment;
         }
       }
     }
-    return WALErrc::Ok;
+    return std::make_unique<Wal>(activeSegment, olderSegments, option, std::move(blockCache), 0);
   }
 
   auto isFull(std::int64_t delta) const -> bool
   {
-    return mActiveSegment->size() + delta + CHUNK_HEADER_SIZE > mOption.segmentSize;
+    return mActiveSegment->size() + delta + kChunkHeaderSize > mOption.segmentSize;
   }
   auto empty() const -> bool
   {
     auto lk = std::shared_lock(mMutex);
     return mOlderSegments.empty() && mActiveSegment->size() == 0;
   }
-  auto option() const -> Option const& { return mOption; }
+  auto option() const -> WalOption const& { return mOption; }
   auto activeSegmentID() const -> SegmentID
   {
     auto lk = std::shared_lock(mMutex);
     return mActiveSegment->id();
   }
-  auto useNewAciveSegment() -> SegmentErrc
+  auto useNewAciveSegment() -> std::error_code
   {
     auto lk = std::scoped_lock(mMutex);
 
-    if (auto err = mActiveSegment->sync(); !err.ok()) {
+    if (auto err = mActiveSegment->sync(); err) {
       return err;
     }
     auto newSegment = std::make_shared<Segment>(mOption.dirPath.string(), mOption.segmentFileExt,
@@ -99,18 +106,18 @@ public:
 
     mOlderSegments[mActiveSegment->id()] = mActiveSegment;
     mActiveSegment = newSegment;
-    return SegmentErrc::Ok;
+    return SegmentErr::Ok;
   }
-  auto write(std::span<std::byte const> data) -> ext::expected<ChunkPosition, WALErrc>
+  auto write(std::span<std::byte const> data) -> ext::expected<ChunkPosition, std::error_code>
   {
     auto lk = std::scoped_lock(mMutex);
 
-    if (data.size() + CHUNK_HEADER_SIZE > mOption.segmentSize) {
-      return ext::make_unexpected(WALErrc::TooLargeValue);
+    if (data.size() + kChunkHeaderSize > mOption.segmentSize) {
+      return ext::make_unexpected(WalErr::TooLargeValue);
     }
     if (isFull(data.size())) {
       auto err = mActiveSegment->sync();
-      if (!err.ok()) {
+      if (err) {
         return ext::make_unexpected(err);
       }
       mBytesWrite = 0;
@@ -118,6 +125,7 @@ public:
                                                mActiveSegment->id() + 1, mBlockCache);
       mOlderSegments[mActiveSegment->id()] = mActiveSegment;
       mActiveSegment = segment;
+      log_debug("create new segment %u\n", mActiveSegment->id());
     }
 
     auto pos = mActiveSegment->write(data);
@@ -126,14 +134,14 @@ public:
     }
     mBytesWrite += pos->mChunkSize;
 
-    auto needSync = mOption.sync;
+    auto needSync = mOption.syncWrite;
     if (!needSync && mOption.bytesPerSync > 0) {
       needSync = mBytesWrite >= mOption.bytesPerSync;
     }
 
     if (needSync) {
       auto err = mActiveSegment->sync();
-      if (!err.ok()) {
+      if (err) {
         return ext::make_unexpected(err);
       }
       mBytesWrite = 0;
@@ -141,7 +149,7 @@ public:
     return pos;
   }
 
-  auto read(ChunkPosition const& pos) -> ext::expected<Bytes, WALErrc>
+  auto read(ChunkPosition const& pos) -> ext::expected<Bytes, std::error_code>
   {
     auto lk = std::shared_lock(mMutex);
 
@@ -151,14 +159,14 @@ public:
     } else {
       auto iter = mOlderSegments.find(pos.mSegmentID);
       if (iter == mOlderSegments.end()) {
-        return ext::make_unexpected(WALErrc::SegmentNotFound);
+        throw std::runtime_error("segment not found");
       }
       segment = iter->second.get();
     }
     return segment->read(pos.mBlockNumber, pos.mChunkOffset);
   }
 
-  auto close() -> WALErrc
+  auto close() -> bool
   {
     auto lk = std::scoped_lock(mMutex);
 
@@ -167,30 +175,28 @@ public:
     }
 
     for (auto const& [id, segment] : mOlderSegments) {
-      auto err = segment->close();
-      if (!err.ok()) {
-        return err;
-      }
+      auto ok = segment->close();
+      assert(ok);
     }
+    mOlderSegments.clear();
     return mActiveSegment->close();
   }
 
-  auto removeFiles() -> WALErrc
+  auto removeFiles() -> bool
   {
     auto lk = std::scoped_lock(mMutex);
     if (mBlockCache != nullptr) {
       mBlockCache->clear();
     }
     for (auto const& [id, segment] : mOlderSegments) {
-      auto err = segment->remove();
-      if (!err.ok()) {
-        return err;
-      }
+      auto ok = segment->remove();
+      assert(ok);
     }
+    mOlderSegments.clear();
     return mActiveSegment->remove();
   }
 
-  auto sync() -> WALErrc
+  auto sync() -> std::error_code
   {
     auto lk = std::scoped_lock(mMutex);
     return mActiveSegment->sync();
@@ -204,7 +210,7 @@ private:
   std::shared_ptr<Segment> mActiveSegment;
   std::map<SegmentID, std::shared_ptr<Segment>> mOlderSegments;
 
-  Option mOption;
+  WalOption mOption;
   mutable std::shared_mutex mMutex;
   std::shared_ptr<Cache<std::uint64_t, Bytes>> mBlockCache;
   std::uint32_t mBytesWrite;
@@ -217,14 +223,14 @@ public:
   {
   }
 
-  auto next(ChunkPosition& pos) -> ext::expected<Bytes, WALErrc>
+  auto next(ChunkPosition& pos) -> ext::expected<Bytes, std::error_code>
   {
     if (mCurrReader >= mReaders.size()) {
-      return ext::make_unexpected(WALErrc::EndOfSegments);
+      return ext::make_unexpected(WalErr::EndOfSegments);
     }
     pos = ChunkPosition{};
     auto data = mReaders[mCurrReader].next(pos);
-    if (!data && data.error().code() == SegmentErrc::EndOfSegment) {
+    if (!data && data.error() == SegmentErr::EndOfSegment) {
       mCurrReader++;
       return next(pos);
     }
@@ -242,13 +248,15 @@ public:
         .mChunkOffset = reader.chunkOffset(),
     };
   }
+  auto readers() const -> std::vector<SegmentReader> const& { return mReaders; }
+  auto currentReaderIdx() const -> std::uint32_t { return mCurrReader; }
 
 private:
   std::vector<SegmentReader> mReaders;
   std::uint32_t mCurrReader;
 };
 
-inline auto WAL::readerWithMax(SegmentID segID) -> WALReader
+inline auto Wal::readerWithMax(SegmentID segID) -> WALReader
 {
   auto lk = std::shared_lock(mMutex);
 
@@ -269,4 +277,4 @@ inline auto WAL::readerWithMax(SegmentID segID) -> WALReader
   return WALReader{std::move(segmentReaders), 0};
 }
 
-inline auto WAL::reader() -> WALReader { return readerWithMax(0); }
+inline auto Wal::reader() -> WALReader { return readerWithMax(0); }

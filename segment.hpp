@@ -3,6 +3,7 @@
 #include "crc32.hpp"
 #include "encoding.hpp"
 #include "errors.hpp"
+#include "file.hpp"
 #include "option.hpp"
 #include "preclude.hpp"
 
@@ -19,7 +20,10 @@ struct ChunkPosition {
   std::int64_t mChunkOffset;
   std::uint32_t mChunkSize;
 
-  auto operator==(ChunkPosition const& rhs) const -> bool = default;
+  auto operator==(ChunkPosition const& rhs) const -> bool
+  {
+    return mSegmentID == rhs.mSegmentID && mBlockNumber == rhs.mBlockNumber && mChunkOffset == rhs.mChunkOffset;
+  }
 };
 
 struct ChunkHeader {
@@ -35,17 +39,18 @@ inline auto getChecksum(ChunkHeader const& header, std::span<std::byte const> da
   return crc32(data, headerCrc);
 }
 
-constexpr std::size_t CHUNK_HEADER_SIZE = 7;
-constexpr std::size_t BLOCK_SIZE = 32 * KiB;
-constexpr int SEGMENT_FILE_PERM = 0644;
+constexpr std::size_t kChunkHeaderSize = 7;
+constexpr std::size_t kBlockSize = 32 * KiB;
+constexpr int kSegmentFilePerm = 0644;
 
 class Bytes {
 public:
   Bytes() = default;
   Bytes(std::size_t cap) : mData(std::make_shared<std::byte[]>(cap)), mCap(cap) {}
+  Bytes(std::size_t cap, std::shared_ptr<std::byte[]>&& data) : mData(std::move(data)), mCap(cap) {}
   Bytes(Bytes&&) = default;
-  Bytes& operator=(Bytes&&) = default;
   Bytes(Bytes const&) = default;
+  Bytes& operator=(Bytes&&) = default;
   Bytes& operator=(Bytes const&) = default;
   ~Bytes() = default;
 
@@ -65,6 +70,14 @@ public:
       mCap = cap;
     }
   }
+  static auto from(std::span<std::byte const> data) -> Bytes
+  {
+    auto ret = Bytes(data.size());
+    std::copy(data.begin(), data.end(), ret.data());
+    return ret;
+  }
+  static auto from(std::string_view str) -> Bytes { return from({(std::byte const*)str.data(), str.size()}); }
+
   auto operator==(Bytes const& rhs) const -> bool
   {
     if (capacity() != rhs.capacity()) {
@@ -76,6 +89,13 @@ public:
 private:
   std::shared_ptr<std::byte[]> mData = nullptr;
   std::size_t mCap = 0;
+};
+
+struct BytesHash {
+  auto operator()(Bytes const& bytes) const -> std::size_t
+  {
+    return std::hash<std::string_view>()(std::string_view((char*)bytes.data(), bytes.capacity()));
+  }
 };
 
 class Buffer : public Bytes {
@@ -128,96 +148,91 @@ public:
       : mId(id), mCache(std::move(cache))
   {
     mFilePath = segmentFileName(dirPath, extName, id);
-    auto fd = ::open(mFilePath.c_str(), O_RDWR | O_CREAT | O_APPEND, SEGMENT_FILE_PERM);
-    if (fd == -1) {
-      throw std::runtime_error(std::format("failed to open segment file: {}", ::strerror(errno)));
-    }
-    mFd = fd;
-    auto offset = lseek(mFd, 0, SEEK_END);
-    if (offset == -1) {
-      throw std::runtime_error(std::format("failed to seek segment file: {}", ::strerror(errno)));
-    }
 
-    mCurrentBlockNumber = offset / BLOCK_SIZE;
-    mCurrentBlockSize = offset % BLOCK_SIZE;
+    auto file = File::open(mFilePath, "a+b");
+    if (!file) {
+      throw std::system_error(make_error_code(file.error()));
+    }
+    std::errc r = file->seek(0, File::End);
+    if (r != std::errc(0)) {
+      throw std::system_error(make_error_code(r));
+    }
+    auto offset = file->tell();
+    if (!offset) {
+      throw std::system_error(make_error_code(offset.error()));
+    }
+    mFile = std::move(file).value();
+    log_debug("segment file %s size: %ld\n", mFilePath.c_str(), *offset);
+    mCurrentBlockNumber = *offset / kBlockSize;
+    mCurrentBlockSize = *offset % kBlockSize;
   }
   ~Segment()
   {
     if (!isClosed()) {
-      ::close(mFd);
-      mFd = -1;
+      mFile.close();
     }
   }
 
-  auto sync() -> SegmentErrc
+  auto sync() -> std::error_code
   {
     if (isClosed()) {
-      return SegmentErrc::SegmentClosed;
+      return SegmentErr::SegmentClosed;
     }
-    auto r = ::fsync(mFd);
-    if (r == -1) {
-      return SegmentErrc::lastSysErrc();
+    if (auto r = mFile.sync(); r != std::errc(0)) {
+      return make_error_code(r);
     }
-    return SegmentErrc::Ok;
+    return SegmentErr::Ok;
   }
   [[nodiscard]] auto id() const -> SegmentID { return mId; }
-  [[nodiscard]] auto size() const -> std::size_t { return mCurrentBlockNumber * BLOCK_SIZE + mCurrentBlockSize; }
-  auto remove() -> SegmentErrc
+  [[nodiscard]] auto size() const -> std::size_t { return mCurrentBlockNumber * kBlockSize + mCurrentBlockSize; }
+  auto remove() -> bool
   {
     if (!isClosed()) {
-      auto r = ::close(mFd);
-      if (r == -1) {
-        return SegmentErrc::lastSysErrc();
+      if (!mFile.close()) {
+        return false;
       }
-      mFd = -1;
     }
     if (std::filesystem::exists(mFilePath)) {
       std::filesystem::remove(mFilePath);
     }
-    return SegmentErrc::Ok;
+    return true;
   }
-  [[nodiscard]] auto isClosed() const -> bool { return mFd == -1; }
-  auto close() -> SegmentErrc
+  [[nodiscard]] auto isClosed() const -> bool { return mFile.isClosed(); }
+  auto close() -> bool
   {
     if (!isClosed()) {
-      auto r = ::close(mFd);
-      if (r == -1) {
-        return SegmentErrc::lastSysErrc();
-      }
-      mFd = -1;
-      return SegmentErrc::Ok;
-    } else {
-      return SegmentErrc::SegmentClosed;
+      return mFile.close();
     }
+    return true;
   }
-  auto write(std::span<std::byte const> data) -> ext::expected<ChunkPosition, SegmentErrc>
+  auto write(std::span<std::byte const> data) -> ext::expected<ChunkPosition, std::error_code>
   {
     if (isClosed()) {
-      return ext::make_unexpected(SegmentErrc::SegmentClosed);
+      return ext::make_unexpected(SegmentErr::SegmentClosed);
     }
-    if (mCurrentBlockSize + CHUNK_HEADER_SIZE >= BLOCK_SIZE) {
-      if (mCurrentBlockSize < BLOCK_SIZE) {
-        auto padding = BLOCK_SIZE - mCurrentBlockSize;
-        auto writeSize = ::ftruncate64(mFd, size() + padding);
-        if (writeSize == -1) {
-          return ext::make_unexpected(SegmentErrc::lastSysErrc());
+    if (mCurrentBlockSize + kChunkHeaderSize >= kBlockSize) {
+      if (mCurrentBlockSize < kBlockSize) {
+        auto padding = kBlockSize - mCurrentBlockSize;
+        if (auto r = mFile.truncate(size() + padding); r != std::errc(0)) {
+          return ext::make_unexpected(make_error_code(r));
         }
       }
       mCurrentBlockNumber++;
       mCurrentBlockSize = 0;
     }
+
     auto position = ChunkPosition{mId, mCurrentBlockNumber, mCurrentBlockSize, static_cast<std::uint32_t>(data.size())};
     auto dataSize = std::uint32_t(data.size());
-    if (mCurrentBlockSize + dataSize + CHUNK_HEADER_SIZE <= BLOCK_SIZE) {
+    if (mCurrentBlockSize + dataSize + kChunkHeaderSize <= kBlockSize) {
       writeImpl(data, ChunkType::Full);
-      position.mChunkSize = dataSize + CHUNK_HEADER_SIZE;
+      position.mChunkSize = dataSize + kChunkHeaderSize;
       return {position};
     }
 
     std::int64_t leftSize = dataSize;
     auto blockCount = std::uint32_t(0);
     while (leftSize > 0) {
-      auto chunkSize = BLOCK_SIZE - mCurrentBlockSize - CHUNK_HEADER_SIZE;
+      auto chunkSize = kBlockSize - mCurrentBlockSize - kChunkHeaderSize;
       if (chunkSize > leftSize) {
         chunkSize = leftSize;
       }
@@ -237,20 +252,19 @@ public:
       leftSize -= chunkSize;
       blockCount++;
     }
-    position.mChunkSize = blockCount * CHUNK_HEADER_SIZE + dataSize;
+    position.mChunkSize = blockCount * kChunkHeaderSize + dataSize;
     return {position};
   }
 
-  auto read(std::uint32_t blockNumber, std::int64_t chunkOffset) -> ext::expected<Bytes, SegmentErrc>
+  auto read(std::uint32_t blockNumber, std::int64_t chunkOffset) -> ext::expected<Bytes, std::error_code>
   {
     auto position = ChunkPosition{mId, blockNumber, chunkOffset, 0};
     return readImpl(position);
   }
-
   auto reader() -> SegmentReader;
 
 private:
-  auto writeImpl(std::span<std::byte const> data, ChunkType type) -> SegmentErrc
+  auto writeImpl(std::span<std::byte const> data, ChunkType type) -> std::error_code
   {
     std::uint32_t const dataSize = data.size();
 
@@ -259,32 +273,31 @@ private:
     header.mType = type;
     header.mCrc = getChecksum(header, data);
 
-    auto writeSize = ::write(mFd, &header, CHUNK_HEADER_SIZE);
-    if (writeSize == -1) {
-      return SegmentErrc::lastSysErrc();
+    if (auto r = mFile.write(&header, kChunkHeaderSize); !r) {
+      assert(r);
     }
 
-    writeSize = ::write(mFd, data.data(), data.size());
-    if (writeSize == -1) {
-      return SegmentErrc::lastSysErrc();
+    if (auto r = mFile.write(data); !r) {
+      assert(r);
     }
 
-    if (mCurrentBlockSize > BLOCK_SIZE) {
+    if (mCurrentBlockSize > kBlockSize) {
       throw std::runtime_error("block size overflow");
     }
 
-    mCurrentBlockSize += CHUNK_HEADER_SIZE + dataSize;
-    if (mCurrentBlockSize == BLOCK_SIZE) {
+    mCurrentBlockSize += kChunkHeaderSize + dataSize;
+    if (mCurrentBlockSize == kBlockSize) {
       mCurrentBlockNumber++;
       mCurrentBlockSize = 0;
     }
-    return SegmentErrc::Ok;
+    return SegmentErr::Ok;
   }
+
   // if success, set position point to the next chunk
-  auto readImpl(ChunkPosition& position) -> ext::expected<Bytes, SegmentErrc>
+  auto readImpl(ChunkPosition& position) -> ext::expected<Bytes, std::error_code>
   {
     if (isClosed()) {
-      return ext::make_unexpected(SegmentErrc::SegmentClosed);
+      return ext::make_unexpected(SegmentErr::SegmentClosed);
     }
     auto blockNumber = position.mBlockNumber;
     auto chunkOffset = position.mChunkOffset;
@@ -293,14 +306,14 @@ private:
     auto nextChunk = ChunkPosition{mId};
     auto result = Buffer();
     for (;;) {
-      std::int64_t size = BLOCK_SIZE;
-      std::int64_t offset = blockNumber * BLOCK_SIZE;
+      std::int64_t size = kBlockSize;
+      std::int64_t offset = blockNumber * kBlockSize;
       Bytes* cachedBlockPtr = nullptr;
-      if (BLOCK_SIZE + offset > segSize) {
+      if (kBlockSize + offset > segSize) {
         size = segSize - offset;
       }
       if (chunkOffset >= size) {
-        return ext::make_unexpected(SegmentErrc::EndOfSegment);
+        return ext::make_unexpected(SegmentErr::EndOfSegment);
       }
       if (mCache) {
         cachedBlockPtr = mCache->get(cacheKey(blockNumber));
@@ -309,30 +322,31 @@ private:
       if (cachedBlockPtr != nullptr) {
         cacheBlock = cachedBlockPtr->clone();
       } else {
-        if (auto r = ::lseek64(mFd, offset, SEEK_SET); r == -1) {
-          return ext::make_unexpected(SegmentErrc::lastSysErrc());
+        if (auto r = mFile.seek(offset, File::Set); r != std::errc(0)) {
+          return ext::make_unexpected(make_error_code(r));
         }
         cacheBlock = Bytes(size);
-        auto readSize = ::read(mFd, cacheBlock.data(), cacheBlock.capacity());
-        if (readSize == -1) {
-          return ext::make_unexpected(SegmentErrc::lastSysErrc());
-        }
-        if (mCache != nullptr && size == BLOCK_SIZE && cachedBlockPtr == nullptr) {
+
+        auto r = mFile.read(cacheBlock.span());
+        assert(r);
+        assert(mFile.eof() == false);
+
+        if (mCache != nullptr && size == kBlockSize && cachedBlockPtr == nullptr) {
           mCache->put(cacheKey(blockNumber), cacheBlock.clone());
         }
       }
       auto header = ChunkHeader();
-      enc::get(cacheBlock.span().subspan(chunkOffset, CHUNK_HEADER_SIZE),
-               std::span((std::byte*)&header, CHUNK_HEADER_SIZE));
-      auto start = chunkOffset + CHUNK_HEADER_SIZE;
+      enc::get(cacheBlock.span().subspan(chunkOffset, kChunkHeaderSize),
+               std::span((std::byte*)&header, kChunkHeaderSize));
+      auto start = chunkOffset + kChunkHeaderSize;
       auto length = header.mLength;
       result.extendCapacity(length);
       result.append(cacheBlock.span().subspan(start, length));
-      auto checksumEnd = chunkOffset + CHUNK_HEADER_SIZE + length;
-      auto checksum = getChecksum(header, cacheBlock.span().subspan(chunkOffset + CHUNK_HEADER_SIZE, length));
+      auto checksumEnd = chunkOffset + kChunkHeaderSize + length;
+      auto checksum = getChecksum(header, cacheBlock.span().subspan(chunkOffset + kChunkHeaderSize, length));
       auto savedChecksum = header.mCrc;
       if (checksum != savedChecksum) {
-        return ext::make_unexpected(SegmentErrc::InvalidChecksum);
+        return ext::make_unexpected(SegmentErr::InvalidCheckSum);
       }
 
       auto chunkType = header.mType;
@@ -340,7 +354,7 @@ private:
         nextChunk.mBlockNumber = blockNumber;
         nextChunk.mChunkOffset = checksumEnd;
 
-        if (checksumEnd + CHUNK_HEADER_SIZE >= BLOCK_SIZE) {
+        if (checksumEnd + kChunkHeaderSize >= kBlockSize) {
           nextChunk.mBlockNumber++;
           nextChunk.mChunkOffset = 0;
         }
@@ -359,7 +373,7 @@ private:
   }
 
   SegmentID mId;
-  int mFd;
+  File mFile;
   std::string mFilePath;
   std::uint32_t mCurrentBlockNumber;
   std::uint32_t mCurrentBlockSize;
@@ -370,16 +384,16 @@ private:
 
 class SegmentReader {
 public:
-  SegmentReader(Segment& segment, std::uint32_t blockNumber, std::int64_t mChunkOffset)
-      : mSegment(&segment), mBlockNumber(blockNumber), mChunkOffset(mChunkOffset)
+  SegmentReader(Segment* segment, std::uint32_t blockNumber, std::int64_t mChunkOffset)
+      : mSegment(segment), mBlockNumber(blockNumber), mChunkOffset(mChunkOffset)
   {
   }
   SegmentReader(SegmentReader const&) = default;
-  [[nodiscard]] auto id() const -> SegmentID { return mSegment->mId; }
-  auto next(ChunkPosition& position) -> ext::expected<Bytes, SegmentErrc>
+  auto id() const -> SegmentID { return mSegment->mId; }
+  auto next(ChunkPosition& position) -> ext::expected<Bytes, std::error_code>
   {
     if (mSegment->isClosed()) {
-      return ext::make_unexpected(SegmentErrc::SegmentClosed);
+      return ext::make_unexpected(SegmentErr::SegmentClosed);
     }
     position = ChunkPosition{mSegment->mId, mBlockNumber, mChunkOffset};
 
@@ -389,7 +403,7 @@ public:
     }
 
     auto chunkSize =
-        position.mBlockNumber * BLOCK_SIZE + position.mChunkOffset - (mBlockNumber * BLOCK_SIZE + mChunkOffset);
+        position.mBlockNumber * kBlockSize + position.mChunkOffset - (mBlockNumber * kBlockSize + mChunkOffset);
     std::swap(mBlockNumber, position.mBlockNumber);
     std::swap(mChunkOffset, position.mChunkOffset);
     position.mChunkSize = chunkSize; // setup chunk size
@@ -404,4 +418,4 @@ private:
   std::int64_t mChunkOffset;
 };
 
-inline auto Segment::reader() -> SegmentReader { return SegmentReader(*this, 0, 0); }
+inline auto Segment::reader() -> SegmentReader { return SegmentReader(this, 0, 0); }

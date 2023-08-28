@@ -15,6 +15,13 @@ inline auto operator==(std::span<std::byte const> const lhs, std::span<std::byte
   return std::memcmp(lhs.data(), rhs.data(), lhs.size()) == 0;
 }
 
+auto removeDir(fs::path const& dir) -> void
+{
+  if (fs::exists(dir)) {
+    fs::remove_all(dir);
+  }
+}
+
 TEST(Segment, WriteFull)
 {
   auto dir = fs::temp_directory_path() / "seg-test-full1";
@@ -60,6 +67,8 @@ TEST(Segment, WriteFull)
     ASSERT_TRUE(v->span() == data);
   }
   seg.remove();
+
+  removeDir(dir);
 }
 
 TEST(Segment, WriteFull2)
@@ -68,7 +77,7 @@ TEST(Segment, WriteFull2)
   fs::create_directories(dir);
   auto seg = Segment(dir.string(), ".SIG", 1, nullptr);
 
-  auto const data = std::vector<std::byte>(BLOCK_SIZE - CHUNK_HEADER_SIZE, std::byte(0x23));
+  auto const data = std::vector<std::byte>(kBlockSize - kChunkHeaderSize, std::byte(0x23));
   auto pos1 = seg.write(data);
   ASSERT_EQ(pos1->mBlockNumber, 0);
   ASSERT_EQ(pos1->mChunkOffset, 0);
@@ -82,6 +91,8 @@ TEST(Segment, WriteFull2)
   auto val2 = seg.read(pos2->mBlockNumber, pos2->mChunkOffset);
   ASSERT_TRUE(val2->span() == data);
   seg.remove();
+
+  removeDir(dir);
 }
 
 TEST(Segment, WritePadding)
@@ -90,7 +101,7 @@ TEST(Segment, WritePadding)
   fs::create_directories(dir);
   auto seg = Segment(dir.string(), ".SIG", 1, nullptr);
 
-  auto const data = std::vector<std::byte>(BLOCK_SIZE - CHUNK_HEADER_SIZE - 3, std::byte(0x23));
+  auto const data = std::vector<std::byte>(kBlockSize - kChunkHeaderSize - 3, std::byte(0x23));
 
   auto pos1 = seg.write(data);
   ASSERT_TRUE(pos1);
@@ -102,6 +113,8 @@ TEST(Segment, WritePadding)
   auto var2 = seg.read(pos1->mBlockNumber, pos1->mChunkOffset);
   ASSERT_TRUE(var2->span() == data);
   seg.remove();
+
+  removeDir(dir);
 }
 
 TEST(Segment, WriteNotFull)
@@ -110,7 +123,7 @@ TEST(Segment, WriteNotFull)
   fs::create_directories(dir);
   auto seg = Segment(dir.string(), ".SIG", 1, nullptr);
 
-  auto const data = std::vector<std::byte>(BLOCK_SIZE + 100, std::byte(0x23));
+  auto const data = std::vector<std::byte>(kBlockSize + 100, std::byte(0x23));
   auto pos1 = seg.write(data);
   ASSERT_TRUE(pos1.has_value());
   auto var1 = seg.read(pos1->mBlockNumber, pos1->mChunkOffset);
@@ -129,13 +142,15 @@ TEST(Segment, WriteNotFull)
   ASSERT_TRUE(var3.has_value());
   ASSERT_TRUE(var3->span() == data);
 
-  auto const data2 = std::vector<std::byte>(BLOCK_SIZE * 3 + 100, std::byte(0x23));
+  auto const data2 = std::vector<std::byte>(kBlockSize * 3 + 100, std::byte(0x23));
   auto pos4 = seg.write(data2);
   ASSERT_TRUE(pos4.has_value());
   auto var4 = seg.read(pos4->mBlockNumber, pos4->mChunkOffset);
   ASSERT_TRUE(var4.has_value());
   ASSERT_TRUE(var4->span() == data2);
   seg.remove();
+
+  removeDir(dir);
 }
 
 TEST(Segment, ReaderFull)
@@ -144,7 +159,7 @@ TEST(Segment, ReaderFull)
   fs::create_directories(dir);
   auto seg = Segment(dir.string(), ".SIG", 1, nullptr);
 
-  auto const data = std::vector<std::byte>(BLOCK_SIZE + 100, std::byte(0x23));
+  auto const data = std::vector<std::byte>(kBlockSize + 100, std::byte(0x23));
   auto pos1 = seg.write(data);
   ASSERT_TRUE(pos1.has_value());
   auto pos2 = seg.write(data);
@@ -164,9 +179,11 @@ TEST(Segment, ReaderFull)
 
   auto var3 = reader.next(rpos);
   ASSERT_FALSE(var3.has_value());
-  ASSERT_TRUE(var3.error() == SegmentErrc::EndOfSegment);
+  ASSERT_TRUE(var3.error() == SegmentErr::EndOfSegment);
 
   seg.remove();
+
+  removeDir(dir);
 }
 
 TEST(Segment, ManyChunksFull)
@@ -191,15 +208,17 @@ TEST(Segment, ManyChunksFull)
     auto rpos = ChunkPosition();
     auto var = reader.next(rpos);
     if (!var.has_value()) {
-      ASSERT_TRUE(var.error() == SegmentErrc::EndOfSegment);
+      ASSERT_TRUE(var.error() == SegmentErr::EndOfSegment);
       break;
     }
     ASSERT_TRUE(var->span() == data);
-    
+
     ASSERT_EQ(rpos.mBlockNumber, positions[i].mBlockNumber);
     ASSERT_EQ(rpos.mChunkOffset, positions[i].mChunkOffset);
     ASSERT_EQ(rpos.mSegmentID, positions[i].mSegmentID);
     i++;
   }
   seg.remove();
+
+  removeDir(dir);
 }

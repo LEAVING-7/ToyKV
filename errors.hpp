@@ -1,69 +1,60 @@
-#include <cerrno>
-#include <cstdint>
+#pragma once
+#include <system_error>
 
-class Errc {
-public:
-  enum class Type : std::uint8_t {
-    Sys,
-    Segment,
-    WAL,
-  };
-  static constexpr inline std::uint16_t Ok = 0;
-  Errc() = delete;
-  Errc(Type type) : mErrCode(Ok), mErrType(type) {}
-  Errc(Type type, std::uint16_t code) : mErrCode(code), mErrType(type) {}
-
-  [[nodiscard]] auto ok() const -> bool { return mErrCode == Ok; }
-  [[nodiscard]] auto code() const -> std::uint16_t { return mErrCode; }
-  [[nodiscard]] auto type() const -> Type { return mErrType; }
-
-  template <Type errType>
-  [[nodiscard]] auto is() const -> bool
-  {
-    return mErrType == errType;
-  }
-
-  operator bool() const { return ok(); }
-
-  auto operator==(Errc const& rhs) const -> bool = default;
-
-private:
-  std::uint16_t mErrCode;
-  Type mErrType;
+enum class SegmentErr {
+  Ok = 0,
+  SegmentClosed,
+  InvalidCheckSum,
+  EndOfSegment,
 };
-
-class SysErrc : public Errc {
-public:
-  SysErrc() : Errc(Errc::Type::Sys, Errc::Ok) {}
-  SysErrc(std::uint16_t code) : Errc(Errc::Type::Sys, code) {}
-
-  static inline auto lastSysErrc() -> SysErrc { return {std::uint16_t(errno)}; }
-
-protected:
-  SysErrc(Errc::Type type, std::uint16_t code) : Errc(type, code) {}
+struct SegmentErrCatagory : std::error_category {
+  auto name() const noexcept -> char const* override;
+  auto message(int ev) const -> std::string override;
 };
+auto segmentErrCatagory() -> SegmentErrCatagory const&;
+auto make_error_code(SegmentErr e) -> std::error_code;
+auto make_error_condition(SegmentErr e) -> std::error_condition;
 
-class SegmentErrc : public SysErrc {
-public:
-  enum Type : std::uint16_t {
-    Ok = 0,
-    SegmentClosed,
-    InvalidChecksum,
-    EndOfSegment,
-  };
-  SegmentErrc() : SysErrc(Errc::Type::Segment, Errc::Ok) {}
-  SegmentErrc(Type type) : SysErrc(Errc::Type::Segment, static_cast<std::uint16_t>(type)) {}
-  SegmentErrc(SysErrc syserr) : SysErrc(syserr) {}
-
-protected:
-  SegmentErrc(Errc::Type type, std::uint16_t code) : SysErrc(type, code) {}
+enum class WalErr {
+  Ok = 0,
+  TooLargeValue,
+  SegmentClosed,
+  InvalidCheckSum,
+  EndOfSegments,
+  InvalidOption,
 };
-
-class WALErrc : public SegmentErrc {
-public:
-  enum Type : std::uint16_t { Ok = 0, TooLargeValue, SegmentNotFound, EndOfSegments };
-
-  WALErrc() : SegmentErrc(Errc::Type::WAL, Errc::Ok) {}
-  WALErrc(Type type) : SegmentErrc(Errc::Type::WAL, static_cast<std::uint16_t>(type)) {}
-  WALErrc(SegmentErrc segerr) : SegmentErrc(segerr) {}
+struct WalErrCatagory : std::error_category {
+  auto name() const noexcept -> char const* override;
+  auto message(int ev) const -> std::string override;
 };
+auto walErrCagagory() -> WalErrCatagory const&;
+auto make_error_code(WalErr e) -> std::error_code;
+auto make_error_condition(WalErr e) -> std::error_condition;
+
+enum class DbErr {
+  Ok = 0,
+  KeyEmpty,
+  KeyNotFound,
+  DBIsUsing,
+  ReadOnlyBatch,
+  BatchCommitted,
+  BatchRollbacked,
+  DBClosed,
+  MergeRunning,
+  InvalidDbOption,
+};
+struct DbErrCatagory : std::error_category {
+  auto name() const noexcept -> char const* override;
+  auto message(int ev) const -> std::string override;
+};
+auto make_error_code(DbErr e) -> std::error_code;
+auto make_error_condition(DbErr e) -> std::error_condition;
+
+namespace std {
+template <>
+struct is_error_code_enum<SegmentErr> : true_type {};
+template <>
+struct is_error_code_enum<WalErr> : true_type {};
+template <>
+struct is_error_code_enum<DbErr> : true_type {};
+} // namespace std
